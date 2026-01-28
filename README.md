@@ -1,5 +1,5 @@
 
-# frame11<img width="1024" height="1536" alt="frame11" src="https://github.com/user-attachments/assets/d5a37109-f9a3-40a7-9ece-37cb66b10fb9" />
+# frame11<img width="256" height="768" alt="frame11" src="https://github.com/user-attachments/assets/d5a37109-f9a3-40a7-9ece-37cb66b10fb9" />
 
 
 frame11 è un tool CLI per Kali Linux dedicato all’analisi offline delle Preferred Network List (PNL) dei dispositivi Wi‑Fi, estratte da Probe Request dirette (802.11) a partire da file PCAP / PCAPNG.
