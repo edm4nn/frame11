@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-frame11 - offline PNL extractor for 802.11 captures (PCAP/PCAPNG)
+frame11 - offline PNL extractor (directed probe SSIDs) from 802.11 captures (PCAP/PCAPNG)
 
 Commands:
-- frame11 pnl   <capture>   -> per-device PNL aggregation
-- frame11 ssids <capture>   -> global SSID totals
+- frame11 pnl   <capture>  -> per-device PNL aggregation
+- frame11 ssids <capture>  -> global SSID totals
+
+Outputs:
+- -o/--out : JSON report
+- --jsonl  : per-event JSONL stream (one event per line)
 
 Extras:
-- ASCII banner at startup (can be disabled with --no-banner)
-- Lightweight progress bar while parsing (can be disabled with --no-progress)
+- Clean Kali-style banner (ANSI 256-color) to stderr (disable with --no-banner/--no-color)
+- Lightweight progress bar while parsing (disable with --no-progress)
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Iterable, Any, List
+from typing import Dict, Optional, Iterable, Any, List, Tuple
 
 try:
     from scapy.all import PcapReader  # type: ignore
@@ -31,46 +35,86 @@ except Exception:
     raise
 
 
-# ----------------------------
-# Banner + Progress
-# ----------------------------
+# ============================
+# Banner (Kali-pro)
+# ============================
 
 BANNER = r"""
-  ______                         __ __
- /_  __/______ ___ ___  ___ ____/ // /
-  / / / __/ _ `__ `__ \/ -_) __/ _  /
- /_/ /_/  \_,_/ /_/ /_/\__/_/ /_//_/
-
-      frame11 :: offline PNL extractor (802.11)
+███████╗██████╗  █████╗ ███╗   ███╗███████╗ ██╗ ██╗
+██╔════╝██╔══██╗██╔══██╗████╗ ████║██╔════╝███║███║
+█████╗  ██████╔╝███████║██╔████╔██║█████╗  ╚██║╚██║
+██╔══╝  ██╔══██╗██╔══██║██║╚██╔╝██║██╔══╝   ██║ ██║
+██║     ██║  ██║██║  ██║██║ ╚═╝ ██║███████╗ ██║ ██║
+╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝ ╚═╝ ╚═╝
+        802.11 PNL extractor (offline)
 """
 
-def print_banner(enabled: bool) -> None:
-    if enabled:
-        # Print to stderr so stdout stays pipe-friendly
-        sys.stderr.write(BANNER.strip("\n") + "\n\n")
-        sys.stderr.flush()
+def _c256(n: int) -> str:
+    return f"\x1b[38;5;{n}m"
 
+def _reset() -> str:
+    return "\x1b[0m"
+
+def _bold() -> str:
+    return "\x1b[1m"
+
+def _dim() -> str:
+    return "\x1b[2m"
+
+def colorize_banner(text: str) -> str:
+    """
+    - logo: neon green (46)
+    - subtitle: dim cyan (51)
+    """
+    lines = text.strip("\n").splitlines()
+    out: List[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append(line)
+            continue
+        low = line.lower()
+        if "802.11" in low or "extractor" in low or "offline" in low:
+            out.append(_dim() + _c256(51) + line + _reset())
+        else:
+            out.append(_bold() + _c256(46) + line + _reset())
+    return "\n".join(out)
+
+def print_banner(enabled: bool, color: bool) -> None:
+    if not enabled:
+        return
+    use_color = color and sys.stderr.isatty()
+    if use_color:
+        sys.stderr.write(colorize_banner(BANNER) + "\n")
+        sys.stderr.write(_dim() + _c256(244) + "[*] loading capture engine... done\n\n" + _reset())
+    else:
+        sys.stderr.write(BANNER.strip("\n") + "\n\n")
+    sys.stderr.flush()
+
+
+# ============================
+# Progress bar (fast)
+# ============================
 
 class ProgressBar:
     """
-    Lightweight progress bar using file position (tell) vs file size.
-    - prints to stderr with carriage return
-    - updates throttled to reduce overhead
+    Minimal overhead progress bar:
+    - percent based on file offset / file size (tell vs size)
+    - throttled updates (default 0.15s)
     """
-    def __init__(self, total_bytes: int, enabled: bool) -> None:
+    def __init__(self, total_bytes: int, enabled: bool, throttle_s: float = 0.15) -> None:
         self.total = max(1, int(total_bytes))
         self.enabled = enabled and sys.stderr.isatty()
+        self.throttle_s = throttle_s
         self.last_update = 0.0
         self.packets = 0
 
-    def update(self, cur_bytes: int, packets_inc: int = 1) -> None:
+    def update(self, cur_bytes: int) -> None:
         if not self.enabled:
             return
+        self.packets += 1
 
-        self.packets += packets_inc
         now = time.monotonic()
-        # Throttle updates to avoid slowing parsing
-        if now - self.last_update < 0.15:
+        if now - self.last_update < self.throttle_s:
             return
         self.last_update = now
 
@@ -78,8 +122,7 @@ class ProgressBar:
         width = 28
         filled = int(pct * width)
         bar = "#" * filled + "-" * (width - filled)
-        msg = f"\r[+] parsing: [{bar}] {pct*100:5.1f}%  pkts={self.packets}"
-        sys.stderr.write(msg)
+        sys.stderr.write(f"\r[+] parsing: [{bar}] {pct*100:5.1f}%  pkts={self.packets}")
         sys.stderr.flush()
 
     def finish(self) -> None:
@@ -89,18 +132,17 @@ class ProgressBar:
         sys.stderr.flush()
 
 
-# ----------------------------
-# Helpers (robust)
-# ----------------------------
+# ============================
+# Helpers
+# ============================
 
-def iso_ts(ts) -> str:
+def iso_ts(ts: Any) -> str:
     """
-    Scapy pkt.time may be float, int, Decimal-like, EDecimal, etc.
-    Normalize to float for datetime.fromtimestamp().
+    pkt.time can be float, int, Decimal/EDecimal-like.
+    Normalize via float() (fallback: float(str(ts))).
     """
     if ts is None:
         return dt.datetime.now(dt.timezone.utc).isoformat()
-
     try:
         ts_f = float(ts)
     except Exception:
@@ -108,132 +150,68 @@ def iso_ts(ts) -> str:
             ts_f = float(str(ts))
         except Exception:
             return dt.datetime.now(dt.timezone.utc).isoformat()
-
     return dt.datetime.fromtimestamp(ts_f, tz=dt.timezone.utc).isoformat()
-
 
 def mac_norm(mac: Optional[str]) -> str:
     return (mac or "").lower()
 
-
 def hash_mac(mac: str, salt: str) -> str:
-    # deterministic pseudonymization per-salt
     h = hashlib.blake2s(digest_size=10)
     h.update(salt.encode("utf-8", errors="ignore"))
     h.update(mac.encode("utf-8", errors="ignore"))
     return h.hexdigest()
 
-
 def safe_ssid_bytes_to_str(b: bytes) -> str:
-    # SSIDs can be non-UTF8; keep robust without crashing
-    try:
-        s = b.decode("utf-8", errors="strict")
-    except Exception:
-        s = b.decode("utf-8", errors="replace")
+    s = b.decode("utf-8", errors="replace")
     return s.replace("\x00", "").strip()
-
 
 def extract_probe_ssid(pkt) -> Optional[str]:
     """
-    Returns SSID string if:
-    - Probe Request
-    - SSID element present
-    - SSID element non-empty (directed probe)
-    Otherwise returns None.
+    Returns SSID if:
+    - Dot11 + ProbeReq
+    - SSID IE present and non-empty (directed probe)
     """
     if not pkt.haslayer(Dot11) or not pkt.haslayer(Dot11ProbeReq):
         return None
 
     elt = pkt.getlayer(Dot11Elt)
     while elt is not None:
-        if getattr(elt, "ID", None) == 0:  # SSID element
+        if getattr(elt, "ID", None) == 0:
             info = getattr(elt, "info", b"") or b""
-            if len(info) == 0:
-                return None  # broadcast probe (no directed SSID)
+            if not info:
+                return None
             return safe_ssid_bytes_to_str(info)
         elt = elt.payload.getlayer(Dot11Elt)
-
     return None
 
 
-def pkt_rssi(pkt) -> Optional[int]:
-    """
-    RSSI availability depends on capture headers (Radiotap/Prism/etc).
-    We'll try common attributes Scapy may expose.
-    """
-    for attr in ("dBm_AntSignal", "dbm_antsignal", "Signal", "rssi"):
-        if hasattr(pkt, attr):
-            try:
-                v = getattr(pkt, attr)
-                if isinstance(v, (int, float)):
-                    return int(v)
-            except Exception:
-                pass
-    return None
-
-
-def pkt_channel(pkt) -> Optional[int]:
-    """
-    Best-effort channel extraction:
-    Try Radiotap freq -> map to channel for common 2.4GHz + basic 5GHz mapping.
-    Often missing; keep optional.
-    """
-    freq = None
-    for attr in ("ChannelFrequency", "channel_freq", "Channel", "freq"):
-        if hasattr(pkt, attr):
-            try:
-                freq = getattr(pkt, attr)
-            except Exception:
-                pass
-
-    if isinstance(freq, (int, float)):
-        f = int(freq)
-        # 2.4 GHz mapping
-        if 2412 <= f <= 2472 and (f - 2407) % 5 == 0:
-            return (f - 2407) // 5
-        if f == 2484:
-            return 14
-        # Simple 5 GHz mapping (rough)
-        if 5000 <= f <= 5900 and f % 5 == 0:
-            ch = (f - 5000) // 5
-            if 1 <= ch <= 200:
-                return ch
-    return None
-
-
-# ----------------------------
+# ============================
 # Data model
-# ----------------------------
+# ============================
 
 @dataclass
 class PnlEvent:
     ts: str
-    src: str          # raw addr2 (may be hidden if output via src_id)
-    src_id: str       # pseudonymized by default
+    src: str          # raw addr2 (STA)
+    src_id: str       # pseudonymized unless --no-anonymize
     ssid: str
-    rssi: Optional[int]
-    channel: Optional[int]
 
 
-# ----------------------------
-# Core logic
-# ----------------------------
+# ============================
+# Core parsing
+# ============================
 
 def iter_pnl_events(
     pcap_path: str,
-    mac_salt: str,
+    salt: str,
     anonymize: bool,
-    min_rssi: Optional[int],
     progress: ProgressBar,
 ) -> Iterable[PnlEvent]:
-    total_bytes = os.path.getsize(pcap_path)
 
     with PcapReader(pcap_path) as pr:
-        # Scapy keeps a file handle; use it for tell() when possible
         fh = getattr(pr, "f", None)
 
         for pkt in pr:
-            # progress update (cheap; throttled)
             if fh is not None:
                 try:
                     progress.update(fh.tell())
@@ -245,29 +223,28 @@ def iter_pnl_events(
                 continue
 
             dot11 = pkt.getlayer(Dot11)
+            if dot11 is None:
+                continue
+
             src = mac_norm(getattr(dot11, "addr2", None))
             if not src:
                 continue
 
-            rssi = pkt_rssi(pkt)
-            if min_rssi is not None and rssi is not None and rssi < min_rssi:
-                continue
-
-            src_id = hash_mac(src, mac_salt) if anonymize else src
-            ch = pkt_channel(pkt)
+            src_id = hash_mac(src, salt) if anonymize else src
 
             yield PnlEvent(
                 ts=iso_ts(getattr(pkt, "time", None)),
                 src=src,
                 src_id=src_id,
                 ssid=ssid,
-                rssi=rssi,
-                channel=ch,
             )
 
-    # Ensure bar ends cleanly
     progress.finish()
 
+
+# ============================
+# Reports
+# ============================
 
 def build_pnl_report(events: Iterable[PnlEvent], min_hits: int) -> Dict[str, Any]:
     devices: Dict[str, Dict[str, Any]] = {}
@@ -275,70 +252,49 @@ def build_pnl_report(events: Iterable[PnlEvent], min_hits: int) -> Dict[str, Any
 
     for ev in events:
         total_events += 1
-
         d = devices.setdefault(ev.src_id, {
-            "ssids": {},
             "first_seen": ev.ts,
             "last_seen": ev.ts,
             "total_hits": 0,
+            "ssids": {},  # ssid -> hits
         })
-
         d["last_seen"] = ev.ts
         d["total_hits"] += 1
+        d["ssids"][ev.ssid] = d["ssids"].get(ev.ssid, 0) + 1
 
-        s = d["ssids"].setdefault(ev.ssid, {
-            "hits": 0,
-            "first_seen": ev.ts,
-            "last_seen": ev.ts,
-            "rssi_min": None,
-            "rssi_max": None,
-            "channels": {},
-        })
-
-        s["hits"] += 1
-        s["last_seen"] = ev.ts
-
-        if ev.rssi is not None:
-            s["rssi_min"] = ev.rssi if s["rssi_min"] is None else min(s["rssi_min"], ev.rssi)
-            s["rssi_max"] = ev.rssi if s["rssi_max"] is None else max(s["rssi_max"], ev.rssi)
-
-        if ev.channel is not None:
-            k = str(ev.channel)
-            s["channels"][k] = s["channels"].get(k, 0) + 1
-
-    # Filter by min_hits per SSID per device
-    filtered_devices: Dict[str, Any] = {}
+    # filter by min_hits per ssid
+    filtered: Dict[str, Any] = {}
     for dev_id, info in devices.items():
-        ssids = {k: v for k, v in info["ssids"].items() if v["hits"] >= min_hits}
+        ssids = {s: h for s, h in info["ssids"].items() if h >= min_hits}
         if not ssids:
             continue
         info2 = dict(info)
         info2["ssids"] = ssids
-        filtered_devices[dev_id] = info2
+        filtered[dev_id] = info2
 
     return {
         "tool": "frame11",
         "mode": "offline_pnl",
         "total_events": total_events,
-        "devices": filtered_devices,
+        "min_hits": min_hits,
+        "devices": filtered,
     }
 
-
 def build_ssid_totals(events: Iterable[PnlEvent], min_hits: int) -> Dict[str, Any]:
-    totals: Dict[str, Any] = {}
+    totals: Dict[str, Dict[str, Any]] = {}
     total_events = 0
 
     for ev in events:
         total_events += 1
-        s = totals.setdefault(ev.ssid, {
+        t = totals.setdefault(ev.ssid, {
             "hits": 0,
             "devices": set(),
             "first_seen": ev.ts,
             "last_seen": ev.ts,
         })
-        s["hits"] += 1
-        s["last_seen"] = ev.ts
-        s["devices"].add(ev.src_id)
+        t["hits"] += 1
+        t["last_seen"] = ev.ts
+        t["devices"].add(ev.src_id)
 
     out: Dict[str, Any] = {}
     for ssid, info in totals.items():
@@ -355,30 +311,29 @@ def build_ssid_totals(events: Iterable[PnlEvent], min_hits: int) -> Dict[str, An
         "tool": "frame11",
         "mode": "ssid_totals",
         "total_events": total_events,
+        "min_hits": min_hits,
         "ssids": out,
     }
 
 
-# ----------------------------
-# CLI commands
-# ----------------------------
+# ============================
+# CLI
+# ============================
 
 def cmd_pnl(args: argparse.Namespace) -> int:
     if not os.path.exists(args.pcap):
         print(f"[-] File not found: {args.pcap}", file=sys.stderr)
         return 2
 
-    print_banner(enabled=not args.no_banner)
+    print_banner(enabled=not args.no_banner, color=not args.no_color)
 
     salt = args.salt or "frame11-default-salt"
-    total_bytes = os.path.getsize(args.pcap)
-    progress = ProgressBar(total_bytes=total_bytes, enabled=not args.no_progress)
+    progress = ProgressBar(os.path.getsize(args.pcap), enabled=not args.no_progress)
 
     events_iter = iter_pnl_events(
         pcap_path=args.pcap,
-        mac_salt=salt,
+        salt=salt,
         anonymize=not args.no_anonymize,
-        min_rssi=args.min_rssi,
         progress=progress,
     )
 
@@ -400,19 +355,17 @@ def cmd_pnl(args: argparse.Namespace) -> int:
     dev_count = len(report["devices"])
     print(f"[+] frame11: events={report['total_events']} devices={dev_count} min_hits={args.min_hits}")
 
-    if dev_count == 0:
-        print("[!] No directed-probe SSIDs found (or all filtered).")
-    else:
-        top_devices = sorted(
-            report["devices"].items(),
-            key=lambda kv: kv[1].get("total_hits", 0),
-            reverse=True
-        )[:args.top]
+    # show top devices by total hits
+    top_items: List[Tuple[str, Dict[str, Any]]] = sorted(
+        report["devices"].items(),
+        key=lambda kv: kv[1].get("total_hits", 0),
+        reverse=True
+    )[:args.top]
 
-        for dev_id, info in top_devices:
-            ssids_sorted = sorted(info["ssids"].items(), key=lambda kv: kv[1]["hits"], reverse=True)
-            ssid_list = ", ".join([f"{ssid}({st['hits']})" for ssid, st in ssids_sorted[:8]])
-            print(f"  - dev {dev_id} hits={info['total_hits']} ssids={len(info['ssids'])} :: {ssid_list}")
+    for dev_id, info in top_items:
+        ssids_sorted = sorted(info["ssids"].items(), key=lambda kv: kv[1], reverse=True)
+        ssid_list = ", ".join([f"{ssid}({hits})" for ssid, hits in ssids_sorted[:8]])
+        print(f"  - dev {dev_id} hits={info['total_hits']} ssids={len(info['ssids'])} :: {ssid_list}")
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
@@ -427,26 +380,27 @@ def cmd_ssids(args: argparse.Namespace) -> int:
         print(f"[-] File not found: {args.pcap}", file=sys.stderr)
         return 2
 
-    print_banner(enabled=not args.no_banner)
+    print_banner(enabled=not args.no_banner, color=not args.no_color)
 
     salt = args.salt or "frame11-default-salt"
-    total_bytes = os.path.getsize(args.pcap)
-    progress = ProgressBar(total_bytes=total_bytes, enabled=not args.no_progress)
+    progress = ProgressBar(os.path.getsize(args.pcap), enabled=not args.no_progress)
 
-    events_iter = iter_pnl_events(
+    events = list(iter_pnl_events(
         pcap_path=args.pcap,
-        mac_salt=salt,
+        salt=salt,
         anonymize=not args.no_anonymize,
-        min_rssi=args.min_rssi,
         progress=progress,
-    )
+    ))
 
-    events = list(events_iter)
     report = build_ssid_totals(events, min_hits=args.min_hits)
     ssids = report["ssids"]
 
     if not ssids:
         print("[!] No directed-probe SSIDs found (or all filtered).")
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(report, f, ensure_ascii=False, indent=2)
+            print(f"[+] Report written: {args.out}")
         return 0
 
     top = sorted(ssids.items(), key=lambda kv: kv[1]["hits"], reverse=True)[:args.top]
@@ -462,18 +416,14 @@ def cmd_ssids(args: argparse.Namespace) -> int:
     return 0
 
 
-# ----------------------------
-# CLI parser
-# ----------------------------
-
 def add_common_args(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("--min-hits", type=int, default=2, help="minimum hits threshold (default: 2)")
+    ap.add_argument("--min-hits", type=int, default=2, help="minimum hits threshold per SSID (default: 2)")
     ap.add_argument("--top", type=int, default=10, help="show top N entries (default: 10)")
-    ap.add_argument("--min-rssi", type=int, default=None, help="drop events with RSSI below this value (if available)")
     ap.add_argument("--salt", default=None, help="salt used for MAC pseudonymization (default: built-in)")
     ap.add_argument("--no-anonymize", action="store_true", help="do not pseudonymize MACs (prints raw addr2)")
     ap.add_argument("--no-banner", action="store_true", help="disable startup banner")
     ap.add_argument("--no-progress", action="store_true", help="disable progress bar")
+    ap.add_argument("--no-color", action="store_true", help="disable colored output")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -500,8 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 
